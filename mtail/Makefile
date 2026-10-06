@@ -1,6 +1,10 @@
-CC = g++
-CFLAGS = -O2 -Wall 
-LDFLAGS = ${CFLAGS} -lcurses
+CC ?= cc
+CFLAGS ?= -O2
+CFLAGS += -std=c99 -Wall -Wextra
+
+# prefer the wide-char ncurses if pkg-config knows about it
+CURSES_CFLAGS := $(shell pkg-config --cflags ncursesw 2>/dev/null)
+CURSES_LIBS := $(shell pkg-config --libs ncursesw 2>/dev/null || echo -lncurses)
 
 EXEC = mtail
 
@@ -13,10 +17,10 @@ install: $(EXEC)
 	cp $(EXEC) $(PREFIX)/bin/
 	chmod a+x $(PREFIX)/bin/$(EXEC)
 
-clean: 
+clean:
 	rm -f *.o $(EXEC)
 
-
 $(EXEC): $(EXEC).c
-	#$(CC) $(CFLAGS) $(LDFLAGS) -o $(EXEC) $(EXEC).c
-	$(CC) $(CFLAGS) -o $(EXEC) $(EXEC).c $(LDFLAGS) 
+	$(CC) $(CFLAGS) $(CURSES_CFLAGS) -o $(EXEC) $(EXEC).c $(LDFLAGS) $(CURSES_LIBS)
+
+.PHONY: default install clean

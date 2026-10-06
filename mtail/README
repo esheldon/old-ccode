@@ -32,10 +32,14 @@ Description
     rows is automatically adjusted to fit all the files within the specified
     number of columns.  
 
-    If the file names become too long, the are truncated to fit the window with a
+    If the file names become too long, they are truncated to fit the window with a
     preceding ...
 
-    To exit the program, hit ctrl-c
+    Files are followed by name, so if a file is truncated or replaced (e.g. by
+    log rotation) the new contents are shown.  The layout is redrawn when the
+    terminal is resized.
+
+    To exit the program, hit q or ctrl-c
 
 
 Installation
@@ -57,9 +61,9 @@ Installation
 Dependencies
 --------------
 
-    The curses library and headers.  On ubuntu/debian you may have to install the
-    development packages:
+    The ncurses library and headers.  On ubuntu/debian you may have to install
+    the development package:
 
-        sudo apt-get install libncurses5 libncurses5-dev
+        sudo apt-get install libncurses-dev
 
 

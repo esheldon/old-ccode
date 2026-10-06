@@ -1,5 +1,5 @@
 /*
-Usage: 
+Usage:
     mtail [-c ncol] file1 file2 file3 ...
 
 Description:
@@ -28,24 +28,28 @@ Description:
 
     where n1,n2... etc. show where the file names are displayed.  The number of
     rows is automatically adjusted to fit all the files within the specified
-    number of columns.  
+    number of columns.
 
-    If the file names become too long, the are truncated to fit the window with a
-    preceding ...
+    If the file names become too long, they are truncated to fit the window
+    with a preceding ...
 
-    To exit the program, hit ctrl-c
+    Files are followed by name, so if a file is truncated or replaced (e.g. by
+    log rotation) the new contents are shown.  The layout is redrawn when the
+    terminal is resized.
+
+    To exit the program, hit q or ctrl-c
 
 Dependencies:
-    The curses library and headers.  On ubuntu/debian you may have to install the
-    development packages:
+    The ncurses library and headers.  On ubuntu/debian you may have to install
+    the development package:
 
-        sudo apt-get install libncurses5 libncurses5-dev
+        sudo apt-get install libncurses-dev
 
 Copyright (C) 2010  Erin Sheldon (erin dot sheldon at gmail dot com)
                     and Eli Rykoff (erykoff at physics dot ucsb dot edu )
 
   This program is free software; you can redistribute it and/or modify
-  it under the terms of version 2 of the GNU General Public License as 
+  it under the terms of version 2 of the GNU General Public License as
   published by the Free Software Foundation.
 
   This program is distributed in the hope that it will be useful,
@@ -59,27 +63,37 @@ Copyright (C) 2010  Erin Sheldon (erin dot sheldon at gmail dot com)
 
 */
 
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <fcntl.h>
+#include <locale.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <curses.h>
 #include <string.h>
-#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#define MAXFILELEN 255
-// 1 second
-#define POLLTIME 1000000
+#include <curses.h>
+
+/* how often to check the files for new data, in milliseconds */
+#define POLL_MS 1000
+
+#define READ_BUFSIZE 8192
+
+/* smallest usable window */
+#define MIN_WIN_ROWS 1
+#define MIN_WIN_COLS 4
 
 struct tail {
-
-    char *buf;
-    char *line_buf;
-
-    char fname[MAXFILELEN];
+    const char *fname;
     int fd;
     WINDOW *win;
-    WINDOW *border_win;
+
+    /* a trailing newline is held back until more text arrives, so the bottom
+     * line of the window is not left blank */
+    int pending_nl;
 
     /* these are row,col in characters on the screen, not the file matrix */
     int startrow;
@@ -87,473 +101,495 @@ struct tail {
 
     int startcol;
     int numcols;
-
-    struct stat sbuf;
 };
 
 struct mtail {
-
-    WINDOW *stdscr;
-
-    long poll_time;
-
     int numfiles;
 
     int ncol; /* number of columns of files */
-    int nrow; 
+    int nrow;
     int xmax; /* size of whole screen */
     int ymax;
 
-    int ywinsize; /* size of each screen if perfect fit */
-    int extra_ychars; /* extra characters to go in first screen */
+    int ywinsize;     /* size of each window if perfect fit */
+    int extra_ychars; /* extra characters to go in first row */
 
     int xwinsize;
-    int extra_xchars;
+    int extra_xchars; /* extra characters to go in first column */
+
+    int too_small; /* terminal is too small to show the layout */
 
     /* one per file + window */
-    struct tail* tst;
-
+    struct tail *tst;
 };
 
-int parse_command_line(int argc, char* argv[], int* ncol, int* numfiles) {
+static volatile sig_atomic_t quit_requested = 0;
+
+static void handle_signal(int sig) {
+    (void)sig;
+    quit_requested = 1;
+}
+
+static void usage(FILE *stream) {
+    fprintf(stream, "Usage: mtail [-c ncol] file1 [file2 file3 ...]\n");
+}
+
+static int parse_command_line(int argc, char *argv[], int *ncol) {
+    int c;
+    char *end;
+    long val;
 
     *ncol = 1;
 
-    int c;
-    while ((c = getopt (argc, argv, "c:")) != -1) {
+    while ((c = getopt(argc, argv, "c:h")) != -1) {
         switch (c) {
             case 'c':
-                *ncol = atoi( optarg );
+                errno = 0;
+                val = strtol(optarg, &end, 10);
+                if (errno != 0 || *end != '\0' || val <= 0 || val > 1000) {
+                    fprintf(stderr, "number of columns must be an integer > 0\n");
+                    exit(EXIT_FAILURE);
+                }
+                *ncol = (int)val;
                 break;
+            case 'h':
+                usage(stdout);
+                exit(EXIT_SUCCESS);
             default:
-                abort();
+                usage(stderr);
+                exit(EXIT_FAILURE);
         }
     }
 
-    if (*ncol <= 0) {
-        fprintf(stderr,"number of columns must be an integer > 0\n");
-        exit(45);
+    if (optind >= argc) {
+        usage(stderr);
+        exit(EXIT_FAILURE);
     }
-    *numfiles = argc - optind;
-    return optind;
 
+    return optind;
 }
 
-struct mtail* mtail_new(int numfiles) {
-    struct mtail* mtst;
+static struct mtail *mtail_new(int numfiles, int ncol) {
+    struct mtail *mtst;
 
-    mtst = (struct mtail*) calloc(1, sizeof(struct mtail));
+    mtst = calloc(1, sizeof(*mtst));
     if (mtst == NULL) {
-        fprintf(stderr,"could not calloc struct mtail\n");
-        exit(45);
+        perror("could not allocate struct mtail");
+        exit(EXIT_FAILURE);
+    }
+
+    mtst->tst = calloc(numfiles, sizeof(*mtst->tst));
+    if (mtst->tst == NULL) {
+        perror("could not allocate struct tail");
+        exit(EXIT_FAILURE);
     }
 
     mtst->numfiles = numfiles;
 
-    mtst->tst = (struct tail *) calloc(numfiles, sizeof(struct tail));
-    if (mtst == NULL) {
-        fprintf(stderr,"could not calloc struct tail\n");
-        exit(45);
-    }
+    /* no point in more columns than files */
+    mtst->ncol = ncol < numfiles ? ncol : numfiles;
 
     return mtst;
 }
 
+static void mtail_free(struct mtail *mtst) {
+    int i;
 
-void open_files(char* argv[], int ind, struct mtail* mtst) {
-    /* Open them files */
-    int i, j;
-    struct tail* tst;
-
-    tst = mtst->tst;
-    for (i=0;i<mtst->numfiles;i++) {
-        if (strlen(argv[ind]) > MAXFILELEN) {
-            fprintf(stderr,"File name too long: %s\n", argv[ind]);
-            exit(45);
+    for (i = 0; i < mtst->numfiles; i++) {
+        if (mtst->tst[i].win != NULL) {
+            delwin(mtst->tst[i].win);
         }
-        strncpy(tst[i].fname, argv[ind],MAXFILELEN);
-        if ((tst[i].fd = open(tst[i].fname, O_RDONLY)) < 0) {
-            fprintf(stderr,"Failed to open %s\n",tst[i].fname);
-            for (j=0;j<i;j++) {
+        if (mtst->tst[i].fd >= 0) {
+            close(mtst->tst[i].fd);
+        }
+    }
+    free(mtst->tst);
+    free(mtst);
+}
+
+static void open_files(char *argv[], int ind, struct mtail *mtst) {
+    int i, j;
+    struct tail *tst = mtst->tst;
+
+    for (i = 0; i < mtst->numfiles; i++) {
+        tst[i].fname = argv[ind + i];
+        tst[i].fd = open(tst[i].fname, O_RDONLY);
+        if (tst[i].fd < 0) {
+            fprintf(stderr, "Failed to open %s: %s\n", tst[i].fname, strerror(errno));
+            for (j = 0; j < i; j++) {
                 close(tst[j].fd);
             }
-            exit(45);
+            exit(EXIT_FAILURE);
         }
-        if (fstat(tst[i].fd, &(tst[i].sbuf)) < 0) {
-            fprintf(stderr,"failed to fstat\n");
-            exit(45);
-        }
-        ind++;
     }
 }
 
-void init_screen(struct mtail* mtst) {
-    if ((mtst->stdscr = initscr()) == NULL) {
-        perror("initscr\n");
-        exit(45);
+static void init_screen(void) {
+    struct sigaction sa;
+
+    setlocale(LC_ALL, "");
+
+    if (initscr() == NULL) {
+        fprintf(stderr, "initscr failed\n");
+        exit(EXIT_FAILURE);
     }
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    curs_set(0);
+    timeout(POLL_MS);
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 }
 
-
-int yseparator_position(struct mtail* mtst, int row) {
-    int ysep_pos;
+static int yseparator_position(struct mtail *mtst, int row) {
     if (row == 0) {
-        ysep_pos = 0;
-    } else {
-        ysep_pos = (mtst->ywinsize+1)*row + mtst->extra_ychars;
+        return 0;
     }
-    return ysep_pos;
+    return (mtst->ywinsize + 1) * row + mtst->extra_ychars;
 }
 
-int xseparator_position(struct mtail* mtst, int col) {
-    int xsep_pos;
-    if (col == 0) {
-        fprintf(stderr,"No separator in column 0\n");
-        exit(45);
-    } else {
-        xsep_pos = mtst->extra_xchars + mtst->xwinsize*col + (col -1);
-    }
-    return xsep_pos;
+/* there is no separator for column 0 */
+static int xseparator_position(struct mtail *mtst, int col) {
+    return mtst->extra_xchars + mtst->xwinsize * col + (col - 1);
 }
-void set_geometry(struct mtail* mtst) {
 
-    struct tail* tst;
+/* returns 0 if the terminal is too small to fit the layout */
+static int set_geometry(struct mtail *mtst) {
+    struct tail *tst = mtst->tst;
     int i, row, col;
 
-    tst = mtst->tst;
+    mtst->nrow = (mtst->numfiles + mtst->ncol - 1) / mtst->ncol;
+    /* e.g. -c 3 with 4 files only fills 2 columns */
+    mtst->ncol = (mtst->numfiles + mtst->nrow - 1) / mtst->nrow;
 
-    mtst->nrow = mtst->numfiles/mtst->ncol;
-    if ((mtst->numfiles % mtst->ncol) != 0) {
-        mtst->nrow += 1;
-    }
-    getmaxyx(mtst->stdscr, mtst->ymax, mtst->xmax);
+    getmaxyx(stdscr, mtst->ymax, mtst->xmax);
 
-    /* don't use the last line, helps with terminals that don't clear upon
-     * quitting like within screen */
-    //mtst->ymax -= 1;
-
-    /* is right here because of our arithmetic for regions sizes */
-    if (mtst->ymax < (mtst->numfiles * 4)) {
-        fprintf(stderr,"Screen too small!\n");
-        endwin();
-        exit(45);
-    }
-
-    /* There will be a separator between rows, so subtract nrows */
-    mtst->ywinsize     = (mtst->ymax - mtst->nrow)/mtst->nrow;
-    mtst->extra_ychars = mtst->ymax - mtst->ywinsize*mtst->nrow - mtst->nrow;
+    /* There will be a separator above each row, so subtract nrow */
+    mtst->ywinsize     = (mtst->ymax - mtst->nrow) / mtst->nrow;
+    mtst->extra_ychars = mtst->ymax - mtst->ywinsize * mtst->nrow - mtst->nrow;
 
     /* only separator *between* columns, so only subtract ncol-1 */
-    mtst->xwinsize     = (mtst->xmax-(mtst->ncol-1))/mtst->ncol;
-    mtst->extra_xchars = mtst->xmax - mtst->xwinsize*mtst->ncol - (mtst->ncol-1);
+    mtst->xwinsize     = (mtst->xmax - (mtst->ncol - 1)) / mtst->ncol;
+    mtst->extra_xchars = mtst->xmax - mtst->xwinsize * mtst->ncol - (mtst->ncol - 1);
 
-    col = -1;
-    row = 0;
+    if (mtst->ywinsize < MIN_WIN_ROWS || mtst->xwinsize < MIN_WIN_COLS) {
+        return 0;
+    }
 
-    for (i=0; i<mtst->numfiles; i++) {
-        if ((i % mtst->nrow) == 0) {
-            row = 0;
-            col += 1;
-        }
+    for (i = 0; i < mtst->numfiles; i++) {
+        row = i % mtst->nrow;
+        col = i / mtst->nrow;
 
         if (row == 0) {
-            /* size of window in y */
             tst[i].numrows = mtst->ywinsize + mtst->extra_ychars;
         } else {
             tst[i].numrows = mtst->ywinsize;
         }
-        tst[i].startrow = yseparator_position(mtst, row)+1;
-
+        tst[i].startrow = yseparator_position(mtst, row) + 1;
 
         if (col == 0) {
             tst[i].startcol = 0;
             tst[i].numcols = mtst->xwinsize + mtst->extra_xchars;
         } else {
-            /* get separator for x: not first column... */
             tst[i].startcol = xseparator_position(mtst, col) + 1;
             tst[i].numcols = mtst->xwinsize;
         }
-
-        row += 1;
     }
 
-    return;
-
+    return 1;
 }
 
-void set_line_bufs(struct mtail* mtst) {
-    int i;
-    struct tail* tst;
-
-    tst = mtst->tst;
-    for (i=0; i<mtst->numfiles; i++) {
-
-        /* each window get's a line for reading from the file.  This we will
-         * not free, but it will be used later as well */
-        if ((tst[i].line_buf = (char *) calloc(tst[i].numcols, sizeof(char))) == NULL) {
-            fprintf(stderr,"shit\n");
-            exit(45);
-        }
-    }
-}
-
-
-void draw_borders(struct mtail* mtst) {
+static void draw_borders(struct mtail *mtst) {
+    struct tail *tst = mtst->tst;
     int i, row, col, x, y;
-    struct tail* tst;
-    chtype linechar=0;
 
-    tst = mtst->tst;
-
-    for (col=1; col<mtst->ncol; col++) {
-        x = xseparator_position(mtst,col);
-        mvvline(0, x, linechar, mtst->ymax);
+    for (col = 1; col < mtst->ncol; col++) {
+        x = xseparator_position(mtst, col);
+        mvvline(0, x, ACS_VLINE, mtst->ymax);
     }
 
-    for (row=0; row<mtst->nrow; row++) {
+    for (row = 0; row < mtst->nrow; row++) {
         y = yseparator_position(mtst, row);
-        mvhline(y,0,linechar,mtst->xmax);
+        mvhline(y, 0, ACS_HLINE, mtst->xmax);
     }
 
+    /* fill in the gaps where the lines cross */
+    for (i = 0; i < mtst->numfiles; i++) {
+        row = i % mtst->nrow;
+        col = i / mtst->nrow;
 
-    /* fill in the gaps created by the lines */
-    col = -1;
-    row = 0;
-
-    for (i=0; i<mtst->numfiles; i++) {
-        if ((i % mtst->nrow) == 0) {
-            row = 0;
-            col += 1;
-        }
-
-        if (col != (mtst->ncol-1)) {
-            y = tst[i].startrow-1;
+        if (col != mtst->ncol - 1) {
+            y = tst[i].startrow - 1;
             x = tst[i].startcol + tst[i].numcols;
-            if (row == 0) {
-                mvaddch(y, x, ACS_TTEE); /* T shape so we don't protrude above line */
-            } else {
-                mvaddch(y, x, ACS_PLUS); /* plus to fill in the gap */
-            }
+            /* T shape on top so we don't protrude above the line */
+            mvaddch(y, x, row == 0 ? ACS_TTEE : ACS_PLUS);
         }
-        /* Determine if we need to draw a plus in the upper right */
-        row += 1;
     }
-
-
-
-    wrefresh(mtst->stdscr);
 }
 
-char *get_basename(char *path)
-{
-    char *base = strrchr(path, '/');
-    return base ? base+1 : path;
+static const char *get_basename(const char *path) {
+    const char *base = strrchr(path, '/');
+    return base ? base + 1 : path;
 }
 
-void print_filenames(struct mtail* mtst) {
-    int i, x, y;
-    int maxlen, len;
-    char name[MAXFILELEN];
-    char ellipses[] = "...";
-    struct tail* tst;
+static void print_filenames(struct mtail *mtst) {
+    struct tail *tst = mtst->tst;
+    const char *bname;
+    int i, x, y, len, maxlen;
 
-    tst = mtst->tst;
-    char *bname;
-
-    for (i=0; i<mtst->numfiles; i++) {
-
-        // not a copy, just pointer
+    attron(A_BOLD);
+    for (i = 0; i < mtst->numfiles; i++) {
         bname = get_basename(tst[i].fname);
-        //len = strlen(tst[i].fname);
-        len = strlen(bname);
-        maxlen = tst[i].numcols-2;
+        len = (int)strlen(bname);
+        maxlen = tst[i].numcols - 2;
+        y = tst[i].startrow - 1;
 
         if (len > maxlen) {
-            //strncpy(name, &tst[i].fname[len-maxlen], MAXFILELEN);
-            strncpy(name, &bname[len-maxlen], MAXFILELEN);
-            memcpy(name, ellipses, 3);
-            len = maxlen;
-        } else {
-            //strncpy(name, tst[i].fname, MAXFILELEN);
-            strncpy(name, bname, MAXFILELEN);
-        }
-
-        y = tst[i].startrow-1;
-        x = tst[i].startcol + (tst[i].numcols - len)/2;
-        if (x < 0) x=0;
-
-        mvwaddstr(mtst->stdscr, y, x, name);
-    }
-    wrefresh(mtst->stdscr);
-}
-
-/* set up each window.  Set the dividers and names */
-void create_windows(struct mtail* mtst) {
-    int i;
-    struct tail* tst;
-
-    tst = mtst->tst;
-
-    for (i=0; i<mtst->numfiles; i++) {
-
-        /* eli didn't use the last column.. */
-        tst[i].win = subwin(mtst->stdscr, 
-                tst[i].numrows, 
-                /*tst[i].numcols-1,*/
-                tst[i].numcols,
-                tst[i].startrow,
-                tst[i].startcol);
-
-        scrollok(tst[i].win,1);
-
-    }
-    wrefresh(mtst->stdscr);
-
-}
-
-int getline(int fd, int line_len, char *line)
-{
-    int i=0;
-    char the_char = 0;
-    int count = 1;
-
-    bzero(line, line_len);
-    while ((i<(line_len-1)) && (count > 0) && (the_char != '\n')) {
-        count = read(fd, &the_char, 1);
-        if ((count > 0) && (the_char != '\n')) {
-            line[i] = the_char;
-        } else if (the_char == '\n') {
-            /* why this extra if? */
-            line[i] = '\n';
-        } else {
-            return(-1);
-        }
-        i++;
-    }
-
-    /* never true */
-    if (i == line_len) {
-        line[i] = '\n';
-    }
-    return(0);
-}
-
-
-
-/* load the initial data */
-void load_initial_file_data(struct mtail* mtst) {
-    int i, ncols, retval;
-    int j,ctr;
-    char* line;
-
-    struct tail* tst;
-    tst = mtst->tst;
-
-    /* Read in files and print out last number of lines */
-    for (i=0; i<mtst->numfiles; i++) {
-
-        ncols = tst[i].numcols;
-        line = tst[i].line_buf;
-
-        lseek(tst[i].fd, tst[i].sbuf.st_size - (tst[i].numrows+2)*ncols, SEEK_SET);
-
-        if ((tst[i].buf = (char *) calloc(tst[i].numrows * ncols, sizeof(char))) == NULL) {
-            fprintf(stderr,"Calloc buf failed\n");
-            exit(45);
-        }
-        ctr = 0;
-        do {
-            retval = getline(tst[i].fd, ncols, line);
-            if (ctr < (tst[i].numrows - 1)) {
-                memcpy((tst[i].buf + ctr * ncols), line, ncols);
-                ctr++;
+            /* show the end of the name with a preceding ... */
+            x = tst[i].startcol + 1;
+            if (maxlen > 3) {
+                mvprintw(y, x, "...%s", bname + len - (maxlen - 3));
             } else {
-                memmove(tst[i].buf, tst[i].buf + ncols, ncols * (tst[i].numrows - 1));
-                memcpy((tst[i].buf + ctr * ncols), line, ncols);
+                mvaddstr(y, x, bname + len - maxlen);
             }
-        } while (retval != -1);
-
-        for (j=0;j<tst[i].numrows;j++) {
-            waddstr(tst[i].win,tst[i].buf + j * ncols);
+        } else {
+            x = tst[i].startcol + (tst[i].numcols - len) / 2;
+            mvaddstr(y, x, bname);
         }
-        wrefresh(tst[i].win);
-
-        free(tst[i].buf);
-
     }
-
-}
-void tail_files(struct mtail* mtst) {
-    int i, ncol, retval;
-    struct stat sbuf_new;
-    char* line;
-    struct tail* tst;
-
-    set_line_bufs(mtst);
-    load_initial_file_data(mtst);
-
-    tst = mtst->tst;
-
-    while(1) {
-        for(i=0;i<mtst->numfiles;i++) {
-
-            line = tst[i].line_buf;
-            ncol = tst[i].numcols;
-
-            if (fstat(tst[i].fd, &sbuf_new) < 0) {
-                exit(45);
-            }
-            if (sbuf_new.st_size > tst[i].sbuf.st_size) {
-                //wrefresh(tst[i].win);
-                memcpy(&(tst[i].sbuf), &sbuf_new, sizeof(sbuf_new));
-                do {
-
-                    retval = getline(tst[i].fd, ncol, line);
-                    waddstr(tst[i].win,line);
-                    //wrefresh(tst[i].win);
-
-                } while (retval != -1);
-                wrefresh(tst[i].win);
-            }
-        }
-        usleep(mtst->poll_time);
-    }
-
+    attroff(A_BOLD);
 }
 
+static void create_windows(struct mtail *mtst) {
+    struct tail *tst = mtst->tst;
+    int i;
 
-int main(int argc, char *argv[])
-{
+    for (i = 0; i < mtst->numfiles; i++) {
+        tst[i].win = newwin(tst[i].numrows, tst[i].numcols,
+                            tst[i].startrow, tst[i].startcol);
+        if (tst[i].win == NULL) {
+            endwin();
+            fprintf(stderr, "failed to create window\n");
+            exit(EXIT_FAILURE);
+        }
+        scrollok(tst[i].win, TRUE);
+    }
+}
 
-    struct mtail* mtst;
+static void destroy_windows(struct mtail *mtst) {
+    int i;
 
-    int numfiles, ncol, ind;
+    for (i = 0; i < mtst->numfiles; i++) {
+        if (mtst->tst[i].win != NULL) {
+            delwin(mtst->tst[i].win);
+            mtst->tst[i].win = NULL;
+        }
+    }
+}
 
-    ind = parse_command_line(argc, argv, &ncol, &numfiles);
+/* write text to the window */
+static void put_text(struct tail *tst, char *buf, size_t n) {
+    size_t i;
 
-    if (numfiles == 0) {
-        printf("Usage: mtail [-c ncol] file1 [file2 file3 ...]\n");
-        exit(0);
+    if (n == 0) {
+        return;
     }
 
-    mtst = mtail_new(numfiles);
-    mtst->ncol = ncol;
-    mtst->poll_time = POLLTIME;
+    /* waddnstr stops at NUL bytes */
+    for (i = 0; i < n; i++) {
+        if (buf[i] == '\0') {
+            buf[i] = '?';
+        }
+    }
 
+    if (tst->pending_nl) {
+        waddch(tst->win, '\n');
+        tst->pending_nl = 0;
+    }
+    if (buf[n - 1] == '\n') {
+        tst->pending_nl = 1;
+        n--;
+    }
+    waddnstr(tst->win, buf, (int)n);
+}
+
+/* read and display everything from the current position to end of file.
+ * Returns 1 if any data was read */
+static int drain(struct tail *tst) {
+    char buf[READ_BUFSIZE];
+    ssize_t n;
+    int got = 0;
+
+    while ((n = read(tst->fd, buf, sizeof(buf))) > 0) {
+        put_text(tst, buf, (size_t)n);
+        got = 1;
+    }
+    return got;
+}
+
+/* display roughly the last screenful of the file */
+static void load_initial_file_data(struct tail *tst) {
+    struct stat st;
+    off_t want, start = 0;
+    char *buf, *p;
+    ssize_t n;
+    size_t total = 0;
+
+    werase(tst->win);
+    tst->pending_nl = 0;
+
+    want = (off_t)tst->numrows * tst->numcols;
+
+    if (fstat(tst->fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (st.st_size > want) {
+            start = st.st_size - want;
+        }
+        lseek(tst->fd, start, SEEK_SET);
+    }
+
+    if (start == 0) {
+        drain(tst);
+        return;
+    }
+
+    /* we probably landed mid line, so skip to the start of the next one */
+    buf = malloc((size_t)want);
+    if (buf == NULL) {
+        drain(tst);
+        return;
+    }
+    while (total < (size_t)want
+           && (n = read(tst->fd, buf + total, (size_t)want - total)) > 0) {
+        total += (size_t)n;
+    }
+
+    p = memchr(buf, '\n', total);
+    if (p != NULL && p + 1 < buf + total) {
+        put_text(tst, p + 1, total - (size_t)(p + 1 - buf));
+    } else if (p == NULL) {
+        put_text(tst, buf, total);
+    }
+    free(buf);
+
+    drain(tst);
+}
+
+/* check for new data, truncation or replacement of the file.  Returns 1 if
+ * the window was updated */
+static int check_file(struct tail *tst) {
+    struct stat st_fd, st_name;
+    off_t pos;
+    int fd, updated = 0;
+
+    if (fstat(tst->fd, &st_fd) < 0) {
+        return 0;
+    }
+
+    if (S_ISREG(st_fd.st_mode)) {
+        pos = lseek(tst->fd, 0, SEEK_CUR);
+        if (pos >= 0 && st_fd.st_size < pos) {
+            /* file was truncated, start again from the beginning */
+            lseek(tst->fd, 0, SEEK_SET);
+            werase(tst->win);
+            tst->pending_nl = 0;
+            updated = 1;
+        }
+    }
+
+    updated |= drain(tst);
+
+    /* follow by name, in case the file was replaced, e.g. by log rotation */
+    if (stat(tst->fname, &st_name) == 0
+            && (st_name.st_ino != st_fd.st_ino || st_name.st_dev != st_fd.st_dev)) {
+        fd = open(tst->fname, O_RDONLY);
+        if (fd >= 0) {
+            close(tst->fd);
+            tst->fd = fd;
+            updated |= drain(tst);
+        }
+    }
+
+    return updated;
+}
+
+/* (re)build the whole display, e.g. at startup or after a resize */
+static void layout(struct mtail *mtst) {
+    int i;
+
+    destroy_windows(mtst);
+    erase();
+
+    mtst->too_small = !set_geometry(mtst);
+    if (mtst->too_small) {
+        mvaddstr(0, 0, "Terminal too small");
+        refresh();
+        return;
+    }
+
+    draw_borders(mtst);
+    print_filenames(mtst);
+    wnoutrefresh(stdscr);
+
+    create_windows(mtst);
+    for (i = 0; i < mtst->numfiles; i++) {
+        load_initial_file_data(&mtst->tst[i]);
+        wnoutrefresh(mtst->tst[i].win);
+    }
+    doupdate();
+}
+
+static void tail_files(struct mtail *mtst) {
+    int i, ch, updated;
+
+    layout(mtst);
+
+    while (!quit_requested) {
+        /* waits up to POLL_MS for a key press */
+        ch = getch();
+        if (ch == 'q' || ch == 'Q') {
+            break;
+        }
+        if (ch == KEY_RESIZE) {
+            layout(mtst);
+            continue;
+        }
+        if (mtst->too_small) {
+            continue;
+        }
+
+        updated = 0;
+        for (i = 0; i < mtst->numfiles; i++) {
+            if (check_file(&mtst->tst[i])) {
+                wnoutrefresh(mtst->tst[i].win);
+                updated = 1;
+            }
+        }
+        if (updated) {
+            doupdate();
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    struct mtail *mtst;
+    int ncol, ind;
+
+    ind = parse_command_line(argc, argv, &ncol);
+
+    mtst = mtail_new(argc - ind, ncol);
     open_files(argv, ind, mtst);
 
-    init_screen(mtst);
-    set_geometry(mtst);
-    draw_borders(mtst);
-    create_windows(mtst);
-    print_filenames(mtst);
-
+    init_screen();
     tail_files(mtst);
-
-    sleep(2);
     endwin();
 
-    return(0);
+    mtail_free(mtst);
+
+    return EXIT_SUCCESS;
 }
-
-

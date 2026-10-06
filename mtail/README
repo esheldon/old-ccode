@@ -35,6 +35,9 @@ Description
     If the file names become too long, they are truncated to fit the window with a
     preceding ...
 
+    The time each file was last modified is shown on the right side of its
+    title bar.  The date is also shown if the file was not modified today.
+
     Files are followed by name, so if a file is truncated or replaced (e.g. by
     log rotation) the new contents are shown.  The layout is redrawn when the
     terminal is resized.
